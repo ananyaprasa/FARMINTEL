@@ -42,32 +42,32 @@
 :root {
   --radius: 0.75rem;
 
-  /* Sage modern bento palette */
-  --background: #f9f8f3;
-  --foreground: #2d362e;
-  --sage-soft: #f0f4ef;
-  --sage-mid: #dce4d9;
+  /* AgriSense blue → green palette */
+  --background: #dff3ff;
+  --foreground: #1f2937;
+  --sage-soft: rgba(255, 255, 255, 0.72);
+  --sage-mid: rgba(255, 255, 255, 0.55);
 
   --card: #ffffff;
-  --card-foreground: #2d362e;
+  --card-foreground: #1f2937;
   --popover: #ffffff;
-  --popover-foreground: #2d362e;
+  --popover-foreground: #1f2937;
 
-  --primary: #4a6741;
-  --primary-foreground: #f9f8f3;
-  --secondary: #f0f4ef;
-  --secondary-foreground: #2d362e;
-  --muted: #f0f4ef;
-  --muted-foreground: #6b7568;
-  --accent: #d4a373;
-  --accent-foreground: #2d362e;
+  --primary: #198754;
+  --primary-foreground: #ffffff;
+  --secondary: #e7f5ec;
+  --secondary-foreground: #1f2937;
+  --muted: #eef8f2;
+  --muted-foreground: #64748b;
+  --accent: #70b7df;
+  --accent-foreground: #17324d;
 
   --destructive: #b3261e;
   --destructive-foreground: #ffffff;
 
-  --border: rgba(45, 54, 46, 0.08);
-  --input: rgba(45, 54, 46, 0.12);
-  --ring: #4a6741;
+  --border: rgba(31, 41, 55, 0.10);
+  --input: rgba(31, 41, 55, 0.12);
+  --ring: #198754;
 }
 
 @keyframes slide-up {
@@ -89,8 +89,28 @@
   * {
     border-color: var(--color-border);
   }
+  html {
+    min-height: 100%;
+    background: linear-gradient(
+      to bottom,
+      #cfeeff 0%,
+      #eaf8ff 48%,
+      #e0f4dc 52%,
+      #b8e2ad 100%
+    );
+    background-attachment: fixed;
+  }
+
   body {
-    background-color: var(--color-background);
+    min-height: 100vh;
+    background: linear-gradient(
+      to bottom,
+      #cfeeff 0%,
+      #eaf8ff 48%,
+      #e0f4dc 52%,
+      #b8e2ad 100%
+    );
+    background-attachment: fixed;
     color: var(--color-foreground);
     font-family: var(--font-display);
     -webkit-font-smoothing: antialiased;

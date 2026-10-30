@@ -6,11 +6,14 @@ import { ConfidenceBar } from "./ConfidenceBar";
 import { useAgri } from "@/lib/agri-store";
 import { TRANSLATIONS } from "@/lib/i18n";
 import { analyzeDisease } from "@/lib/api";
+import { AnalysisSaveOptions } from "@/components/analysis/AnalysisSaveOptions";
 
 export function DiseaseTab() {
   const { lang, disease, setDisease } = useAgri();
   const t = TRANSLATIONS[lang].disease;
   const [loading, setLoading] = useState(false);
+  const [saveToHistory, setSaveToHistory] = useState(false);
+  const [fieldId, setFieldId] = useState("");
 
   const urgencyLabel = (u?: string) => {
     if (u === "high") return t.urgencyHigh;
@@ -23,11 +26,15 @@ export function DiseaseTab() {
   const onFile = async (f: File) => {
     setLoading(true);
     try {
-      const res = await analyzeDisease(f, lang);
+      const res = await analyzeDisease(f, lang, {
+        saveToHistory,
+        fieldId: fieldId || undefined,
+      });
       setDisease(res);
+      if (res.analysis_id) toast.success("Analysis saved to history.");
     } catch (e) {
       console.error(e);
-      toast.error(t.error);
+      toast.error(e instanceof Error ? e.message : t.error);
     } finally {
       setLoading(false);
     }
@@ -40,6 +47,15 @@ export function DiseaseTab() {
         subtitle={t.subtitle}
         workflowId={t.workflowId}
       />
+
+      <div className="mb-5">
+        <AnalysisSaveOptions
+          saveToHistory={saveToHistory}
+          onSaveToHistoryChange={setSaveToHistory}
+          fieldId={fieldId}
+          onFieldIdChange={setFieldId}
+        />
+      </div>
 
       <div className="grid gap-6 lg:grid-cols-5">
         <div className="lg:col-span-3">

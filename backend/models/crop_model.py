@@ -28,7 +28,7 @@ FEATURE_RANGES = {
     "rainfall":    (0,  3000),
 }
 
-# Centroids calculated from Kaggle Crop Recommendation dataset for pure numpy fallback
+# Stored numeric profiles used by the existing centroid fallback.
 CROP_CENTROIDS: dict[str, list[float]] = {
     "rice":        [79.9,  47.6,  39.9, 23.7, 82.3, 6.4, 236.2],
     "maize":       [77.8,  48.4,  19.8, 22.4, 65.1, 6.2,  84.8],
@@ -93,6 +93,9 @@ class CentroidCropModel:
             dist = np.sqrt(np.sum(((vec - c_arr) / stds) ** 2))
             scores[crop] = float(1.0 / (1.0 + dist))
 
+        if not scores:
+            raise RuntimeError("No crop profiles are configured for fallback recommendations.")
+
         total = sum(scores.values())
         sorted_crops = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         top_crop = sorted_crops[0][0]
@@ -129,10 +132,14 @@ class CropModel:
         if self.model is None:
             raise RuntimeError("Crop model not loaded. Call load() first.")
 
-        features = np.array([[n, p, k, temperature, humidity, ph, rainfall]], dtype=np.float32)
+        values = [n, p, k, temperature, humidity, ph, rainfall]
+        if not np.isfinite(values).all():
+            raise ValueError("Crop inputs must all be finite numbers.")
+
+        features = np.array([values], dtype=np.float32)
 
         warnings = []
-        vals = dict(zip(FEATURE_NAMES, [n, p, k, temperature, humidity, ph, rainfall]))
+        vals = dict(zip(FEATURE_NAMES, values))
         for feat, (lo, hi) in FEATURE_RANGES.items():
             v = vals[feat]
             if not (lo <= v <= hi):
@@ -141,6 +148,8 @@ class CropModel:
         if isinstance(self.model, CentroidCropModel):
             crop_name, recs = self.model.predict(features)
             recommendations = [{"crop": c, "probability": prob} for c, prob in recs]
+            model_source = "centroid_fallback"
+            score_kind = "profile_similarity_share"
         elif self.label_encoder is not None:
             pred_encoded = self.model.predict(features)
             pred_val     = int(np.asarray(pred_encoded).ravel()[0])
@@ -159,13 +168,34 @@ class CropModel:
                 ]
             else:
                 recommendations = [{"crop": crop_name, "probability": 100.0}]
+            model_source = "catboost"
+            score_kind = "model_class_score"
         else:
-            crop_name = "jute"
-            recommendations = [{"crop": "jute", "probability": 100.0}]
+            raise RuntimeError(
+                "Crop model has no usable label encoder; reload it to activate the fallback."
+            )
+
+        unique_recommendations = []
+        seen_crops = set()
+        for recommendation in recommendations:
+            canonical_crop = str(recommendation["crop"]).strip()
+            crop_key = canonical_crop.casefold()
+            if canonical_crop and crop_key not in seen_crops:
+                seen_crops.add(crop_key)
+                unique_recommendations.append(
+                    {**recommendation, "crop": canonical_crop}
+                )
+            if len(unique_recommendations) == 5:
+                break
+
+        if not unique_recommendations:
+            raise RuntimeError("Crop model returned no usable recommendations.")
 
         return {
             "recommended_crop": crop_name,
             "tip":              CROP_TIPS.get(crop_name.lower(), "Consult your local agricultural extension officer."),
-            "recommendations":  recommendations,
+            "recommendations":  unique_recommendations,
             "input_warnings":   warnings,
+            "model_source":     model_source,
+            "score_kind":       score_kind,
         }

@@ -6,6 +6,8 @@ export function ImageDrop({
   hint,
   cta,
   loading,
+  disabled = false,
+  previewAlt = "Image preview",
   onFile,
   onClear,
 }: {
@@ -13,6 +15,8 @@ export function ImageDrop({
   hint: string;
   cta: string;
   loading?: boolean;
+  disabled?: boolean;
+  previewAlt?: string;
   onFile: (f: File) => void;
   onClear?: () => void;
 }) {
@@ -21,6 +25,7 @@ export function ImageDrop({
   const [dragOver, setDragOver] = useState(false);
 
   const handle = (f: File) => {
+    if (disabled) return;
     setPreview(URL.createObjectURL(f));
     onFile(f);
   };
@@ -28,6 +33,7 @@ export function ImageDrop({
   const onDrop = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setDragOver(false);
+    if (disabled) return;
     const f = e.dataTransfer.files?.[0];
     if (f) handle(f);
   };
@@ -43,7 +49,7 @@ export function ImageDrop({
       <div
         onDragOver={(e) => {
           e.preventDefault();
-          setDragOver(true);
+          if (!disabled) setDragOver(true);
         }}
         onDragLeave={() => setDragOver(false)}
         onDrop={onDrop}
@@ -57,7 +63,7 @@ export function ImageDrop({
           <>
             <img
               src={preview}
-              alt="preview"
+              alt={previewAlt}
               className="absolute inset-0 h-full w-full object-cover"
             />
             {loading ? (
@@ -88,6 +94,7 @@ export function ImageDrop({
             <button
               type="button"
               onClick={() => inputRef.current?.click()}
+              disabled={disabled}
               className="mt-6 rounded-full bg-primary px-6 py-2.5 text-sm font-medium text-primary-foreground shadow-lg shadow-primary/10 transition-colors hover:bg-primary/90"
             >
               {cta}
@@ -98,6 +105,7 @@ export function ImageDrop({
           ref={inputRef}
           type="file"
           accept="image/*"
+          disabled={disabled}
           className="hidden"
           onChange={(e) => {
             const f = e.target.files?.[0];

@@ -8,7 +8,9 @@ Docs: http://localhost:8000/docs
 import logging
 import os
 from pathlib import Path
-
+from datetime import date, datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from fastapi import Query
 # Disable TensorFlow to prevent Keras 3 compatibility issues in transformers
 os.environ["USE_TF"] = "0"
 os.environ["USE_TORCH"] = "1"
@@ -22,14 +24,24 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, FiniteFloat
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("agrosense")
+
+LLM_KEY_PLACEHOLDERS = {"your_openai_api_key_here", "your_gemini_api_key_here"}
+
+
+def _get_llm_api_key() -> str:
+    for name in ("OPENAI_API_KEY", "GEMINI_API_KEY"):
+        value = (os.getenv(name) or "").strip()
+        if value and value not in LLM_KEY_PLACEHOLDERS:
+            return value
+    return ""
+
 
 # ── Lazy imports (keep startup fast even if some deps missing) ────────────────
 try:
@@ -40,10 +52,45 @@ try:
     from services.rag_service import RAGService
     from services.llm_service import LLMService
     from services.search_service import WebSearchService
-    from utils.preprocessing import preprocess_image
+    from utils.preprocessing import preprocess_image, preprocess_soil_image
     from utils.cache import cache
-    from middleware.auth import get_current_user, create_token_response, TokenResponse, User
+    from middleware.auth import (
+        AuthConfigurationError,
+        AuthStorageError,
+        AuthenticatedUser,
+        GoogleSignInError,
+        complete_google_sign_in,
+        get_current_user,
+        logout_google_user,
+        start_google_sign_in,
+    )
+    from analysis_history import (
+        AnalysisIndexError,
+        AnalysisSaveOptions,
+        initialize_analysis_indexes,
+        router as analyses_router,
+        save_inference_result,
+    )
+    from farms import FarmIndexError, initialize_farm_indexes, router as farms_router
+    from services.weather_service import get_weather, WeatherServiceError
+    from services.weather_crop_service import recommend_weather_crops
+    from database import MongoDBError, MongoDatabase
 except ImportError:
+    from backend.services.weather_service import get_weather, WeatherServiceError
+    from backend.services.weather_crop_service import recommend_weather_crops
+    from backend.database import MongoDBError, MongoDatabase
+    from backend.farms import (
+        FarmIndexError,
+        initialize_farm_indexes,
+        router as farms_router,
+    )
+    from backend.analysis_history import (
+        AnalysisIndexError,
+        AnalysisSaveOptions,
+        initialize_analysis_indexes,
+        router as analyses_router,
+        save_inference_result,
+    )
     from backend.models.disease_model import DiseaseModel
     from backend.models.soil_model import SoilModel
     from backend.models.crop_model import CropModel
@@ -51,9 +98,18 @@ except ImportError:
     from backend.services.rag_service import RAGService
     from backend.services.llm_service import LLMService
     from backend.services.search_service import WebSearchService
-    from backend.utils.preprocessing import preprocess_image
+    from backend.utils.preprocessing import preprocess_image, preprocess_soil_image
     from backend.utils.cache import cache
-    from backend.middleware.auth import get_current_user, create_token_response, TokenResponse, User
+    from backend.middleware.auth import (
+        AuthConfigurationError,
+        AuthStorageError,
+        AuthenticatedUser,
+        GoogleSignInError,
+        complete_google_sign_in,
+        get_current_user,
+        logout_google_user,
+        start_google_sign_in,
+    )
 
 
 def safe_get_remote_address(request: Request) -> str:
@@ -88,6 +144,31 @@ async def lifespan(app: FastAPI):
     global disease_model, soil_model, crop_model_obj, rag_service, llm_service, search_service
     search_service = WebSearchService()
 
+    # ── MongoDB ─────────────────────────────────────────────────────────────
+    app.state.farm_indexes_unavailable = True
+    app.state.analysis_indexes_unavailable = True
+    try:
+        app.state.mongo_database = MongoDatabase.from_env()
+        app.state.mongo_error = None
+        try:
+            await app.state.mongo_database.ping()
+            await initialize_farm_indexes(app.state.mongo_database.database)
+            app.state.farm_indexes_unavailable = False
+            await initialize_analysis_indexes(app.state.mongo_database.database)
+            app.state.analysis_indexes_unavailable = False
+            logger.info("MongoDB connectivity check succeeded.")
+        except MongoDBError as exc:
+            app.state.mongo_error = exc
+            logger.warning("MongoDB connectivity check failed (%s): %s", exc.code, exc)
+        except FarmIndexError:
+            logger.error("Farm and field indexes could not be initialized.")
+        except AnalysisIndexError:
+            logger.error("Analysis history indexes could not be initialized.")
+    except MongoDBError as exc:
+        app.state.mongo_database = None
+        app.state.mongo_error = exc
+        logger.error("MongoDB is unavailable (%s): %s", exc.code, exc)
+
     # ── Cache ────────────────────────────────────────────────────────────────
     cache._redis_url = os.getenv("REDIS_URL")
     await cache.connect()
@@ -107,7 +188,7 @@ async def lifespan(app: FastAPI):
         return str(base_dir / default_rel)
 
     disease_model = DiseaseModel(
-        model_path  = resolve_backend_path("DISEASE_MODEL_PATH", "models/disease_model_fp16.pth"),
+        model_path  = resolve_backend_path("DISEASE_MODEL_PATH", "models/disease_model_93_plantdoc_deep_ft_best.pth"),
         num_classes = int(os.getenv("DISEASE_NUM_CLASSES", "38")),
     )
     try:
@@ -137,19 +218,25 @@ async def lifespan(app: FastAPI):
     rag_service = RAGService(docs_dir=resolve_backend_path("RAG_DOCS_DIR", "rag_docs"))
 
     # ── LLM ──────────────────────────────────────────────────────────────────
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    api_key = _get_llm_api_key()
     base_url = (os.getenv("OPENAI_BASE_URL") or "").strip() or None
-    if api_key and api_key != "your_openai_api_key_here":
+    if api_key:
         llm_service = LLMService(api_key=api_key, base_url=base_url)
         logger.info("LLM service initialized (base_url=%s).", base_url or "default")
     else:
-        logger.warning("OPENAI_API_KEY not configured in backend/.env — LLM endpoints disabled.")
+        logger.warning("Neither OPENAI_API_KEY nor GEMINI_API_KEY is configured — LLM endpoints disabled.")
 
     logger.info("AgroSense AI startup complete.")
-    yield
-
-    await cache.close()
-    logger.info("AgroSense AI shutdown complete.")
+    try:
+        yield
+    finally:
+        mongo_database = getattr(app.state, "mongo_database", None)
+        try:
+            if mongo_database is not None:
+                await mongo_database.close()
+        finally:
+            await cache.close()
+            logger.info("AgroSense AI shutdown complete.")
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
@@ -161,6 +248,8 @@ app     = FastAPI(
     lifespan    = lifespan,
 )
 app.state.limiter = limiter
+app.state.farm_indexes_unavailable = True
+app.state.analysis_indexes_unavailable = True
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 cors_origins_env = os.getenv("CORS_ORIGINS", "*").strip()
@@ -177,22 +266,39 @@ else:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
-        allow_origin_regex=r"https://.*\.vercel\.app",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
+app.include_router(farms_router)
+app.include_router(analyses_router)
 
 # ── Request / Response Schemas ────────────────────────────────────────────────
 class CropInput(BaseModel):
-    N: float = Field(..., ge=0, le=140, description="Nitrogen content (mg/kg)")
-    P: float = Field(..., ge=0, le=145, description="Phosphorus content (mg/kg)")
-    K: float = Field(..., ge=0, le=205, description="Potassium content (mg/kg)")
-    temperature: float = Field(..., ge=8.0, le=45.0, description="Temperature in °C")
-    humidity: float = Field(..., ge=14.0, le=100.0, description="Relative humidity %")
-    ph: float = Field(..., ge=3.5, le=10.0, description="Soil pH level")
-    rainfall: float = Field(..., ge=20.0, le=300.0, description="Rainfall in mm")
+    N: FiniteFloat = Field(
+        ..., ge=0, le=140,
+        description="Nitrogen feature; the training CSV does not specify its unit.",
+    )
+    P: FiniteFloat = Field(
+        ..., ge=0, le=145,
+        description="Phosphorus feature; the training CSV does not specify its unit.",
+    )
+    K: FiniteFloat = Field(
+        ..., ge=0, le=205,
+        description="Potassium feature; the training CSV does not specify its unit.",
+    )
+    temperature: FiniteFloat = Field(..., ge=8.0, le=45.0, description="Temperature in °C")
+    humidity: FiniteFloat = Field(..., ge=14.0, le=100.0, description="Relative humidity %")
+    ph: FiniteFloat = Field(..., ge=3.5, le=10.0, description="Soil pH level")
+    rainfall: FiniteFloat = Field(
+        ..., ge=20.0, le=300.0,
+        description="Rainfall in mm; the training CSV does not specify the time period.",
+    )
+    language: str = Field(
+        "en",
+        description="UI language; crop labels and model tips are returned in English.",
+    )
 
 
 class AdviceRequest(BaseModel):
@@ -255,51 +361,157 @@ async def root():
     """
 
 
+
+@app.get("/api/v1/weather", tags=["weather"])
+async def weather_forecast(
+    latitude: FiniteFloat = Query(..., ge=-90, le=90),
+    longitude: FiniteFloat = Query(..., ge=-180, le=180),
+    selected_date: date | None = Query(None, alias="date"),
+    timezone: str = Query("auto", min_length=1, max_length=64),
+):
+    try:
+        local_timezone = None
+        if timezone != "auto":
+            try:
+                local_timezone = ZoneInfo(timezone)
+            except (ZoneInfoNotFoundError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Timezone must be 'auto' or a valid IANA timezone.",
+                ) from exc
+        forecast_date = selected_date
+        if forecast_date is None:
+            forecast_date = (
+                datetime.now(local_timezone).date()
+                if local_timezone
+                else date.today()
+            )
+        cache_key = (
+            f"weather:{latitude:.5f}:{longitude:.5f}:"
+            f"{forecast_date}:{timezone}"
+        )
+        cached = await cache.get(cache_key)
+        if cached:
+            return cached
+
+        result = await get_weather(
+            latitude=latitude,
+            longitude=longitude,
+            selected_date=forecast_date,
+            timezone=timezone,
+        )
+        result["crop_recommendations"] = recommend_weather_crops(result)
+        await cache.set(cache_key, result, ttl=300)
+        return result
+
+    except HTTPException:
+        raise
+
+    except WeatherServiceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    except Exception:
+        logger.exception("Weather endpoint failed")
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while fetching weather.",
+        )
+
 # ── Health check ──────────────────────────────────────────────────────────────
 @app.get("/health", response_model=None, tags=["system"])
 @app.get("/api/v1/health", response_model=None, tags=["system"])
-async def health_check():
-    key_val = os.getenv("OPENAI_API_KEY") or ""
-    key_status = "missing"
-    if key_val:
-        if key_val == "your_openai_api_key_here":
-            key_status = "default_placeholder"
-        else:
-            key_status = f"present (len={len(key_val)}, start={key_val[:4]}...)"
-            
-    base_url_val = os.getenv("OPENAI_BASE_URL") or ""
-
+async def health_check(request: Request):
     disease_loaded = disease_model is not None and getattr(disease_model, "model", None) is not None
     soil_loaded = soil_model is not None and getattr(soil_model, "model", None) is not None
     crop_loaded = crop_model_obj is not None and getattr(crop_model_obj, "model", None) is not None
 
     disease_is_fallback = type(getattr(disease_model, "model", None)).__name__ == "FallbackDiseaseModel"
-    soil_is_fallback = type(getattr(soil_model, "model", None)).__name__ == "FallbackSoilModel"
     crop_is_fallback = type(getattr(crop_model_obj, "model", None)).__name__ == "CentroidCropModel"
+
+    mongo_database = getattr(request.app.state, "mongo_database", None)
+    mongo_error = getattr(request.app.state, "mongo_error", None)
+    if mongo_database is None:
+        mongodb_status = "not_configured" if (
+            mongo_error is not None and mongo_error.code == "not_configured"
+        ) else "disconnected"
+        mongodb_error = (
+            {"code": mongo_error.code, "message": str(mongo_error)}
+            if mongo_error is not None
+            else None
+        )
+    else:
+        try:
+            await mongo_database.ping()
+            mongodb_status = "connected"
+            mongodb_error = None
+            request.app.state.mongo_error = None
+        except MongoDBError as exc:
+            mongodb_status = "disconnected"
+            mongodb_error = {"code": exc.code, "message": str(exc)}
+            request.app.state.mongo_error = exc
 
     return {
         "status": "healthy",
+        "application_status": "running",
+        "mongodb": {
+            "status": mongodb_status,
+            "error": mongodb_error,
+        },
         "version": "1.0.0",
         "models_loaded": {
             "disease": disease_loaded and not disease_is_fallback,
-            "soil":    soil_loaded and not soil_is_fallback,
+            "soil":    soil_loaded,
             "crop":    crop_loaded and not crop_is_fallback,
         },
         "models_status": {
             "disease": "neural_network" if (disease_loaded and not disease_is_fallback) else ("fallback" if disease_loaded else "unloaded"),
-            "soil":    "neural_network" if (soil_loaded and not soil_is_fallback) else ("fallback" if soil_loaded else "unloaded"),
+            "soil":    "neural_network" if soil_loaded else "unloaded",
             "crop":    "catboost" if (crop_loaded and not crop_is_fallback) else ("centroid_fallback" if crop_loaded else "unloaded"),
         },
         "redis_connected": cache._redis_url is not None and cache._backend is not None,
-        "debug_openai_key": key_status,
-        "debug_openai_base_url": base_url_val
     }
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-@app.post("/api/v1/auth/token", response_model=TokenResponse, tags=["auth"])
-async def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]):
-    return create_token_response(form_data)
+@app.get("/api/v1/auth/google/start", tags=["auth"])
+async def google_sign_in_start():
+    try:
+        return start_google_sign_in()
+    except AuthConfigurationError:
+        raise HTTPException(
+            status_code=503, detail="Google sign-in is not configured."
+        ) from None
+
+
+@app.post("/api/v1/auth/google/callback", tags=["auth"], include_in_schema=False)
+async def google_sign_in_callback(request: Request):
+    try:
+        return await complete_google_sign_in(request)
+    except AuthConfigurationError:
+        raise HTTPException(
+            status_code=503, detail="Google sign-in is not configured."
+        ) from None
+    except GoogleSignInError as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail=str(exc)
+        ) from None
+    except AuthStorageError:
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication service is temporarily unavailable.",
+        ) from None
+
+
+@app.get("/api/v1/auth/me", response_model=AuthenticatedUser, tags=["auth"])
+async def auth_me(
+    user: Annotated[AuthenticatedUser, Depends(get_current_user)],
+) -> AuthenticatedUser:
+    return user
+
+
+@app.post("/api/v1/auth/logout", status_code=204, tags=["auth"])
+async def auth_logout(request: Request):
+    return logout_google_user(request)
 
 
 # ── Disease detection ─────────────────────────────────────────────────────────
@@ -309,6 +521,7 @@ async def analyze_disease(
     request : Request,
     file    : UploadFile = File(..., description="Plant leaf image"),
     lang    : Optional[str] = Form("en"),
+    save_options: Annotated[AnalysisSaveOptions, Depends()] = AnalysisSaveOptions(),
 ):
     global disease_model
     if disease_model is None:
@@ -332,7 +545,13 @@ async def analyze_disease(
     try:
         cached = await cache.get(f"disease:{cache_key}")
         if cached and isinstance(cached, dict):
-            return {**cached, "cached": True}
+            response = {**cached, "cached": True}
+            analysis_id = await save_inference_result(
+                request, save_options, "disease", response
+            )
+            if analysis_id is not None:
+                response["analysis_id"] = analysis_id
+            return response
     except Exception as e:
         logger.warning("Cache check skipped: %s", e)
 
@@ -347,7 +566,13 @@ async def analyze_disease(
     except Exception as e:
         logger.warning("Cache write skipped: %s", e)
 
-    return {**result, "cached": False}
+    response = {**result, "cached": False}
+    analysis_id = await save_inference_result(
+        request, save_options, "disease", response
+    )
+    if analysis_id is not None:
+        response["analysis_id"] = analysis_id
+    return response
 
 
 # ── Soil analysis ─────────────────────────────────────────────────────────────
@@ -357,6 +582,7 @@ async def analyze_soil(
     request : Request,
     file    : UploadFile = File(..., description="Soil image"),
     lang    : Optional[str] = Form("en"),
+    save_options: Annotated[AnalysisSaveOptions, Depends()] = AnalysisSaveOptions(),
 ):
     global soil_model
     if soil_model is None:
@@ -369,7 +595,7 @@ async def analyze_soil(
         raise HTTPException(status_code=413, detail="File too large (max 10 MB).")
 
     try:
-        tensor, cache_key = preprocess_image(image_bytes)
+        tensor, cache_key = preprocess_soil_image(image_bytes)
         logger.info(f"File Size: {len(image_bytes)} | Hash: {cache_key}")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -379,23 +605,51 @@ async def analyze_soil(
 
     try:
         cached = await cache.get(f"soil:{cache_key}")
-        if cached and isinstance(cached, dict):
-            return {**cached, "cached": True}
+        if (
+            isinstance(cached, dict)
+            and isinstance(cached.get("soil_type"), str)
+            and isinstance(cached.get("confidence"), (int, float))
+            and 0 <= cached["confidence"] <= 100
+            and cached.get("confidence_method") == "softmax_score"
+            and isinstance(cached.get("all_classes"), list)
+        ):
+            response = {**cached, "cached": True}
+            analysis_id = await save_inference_result(
+                request, save_options, "soil", response
+            )
+            if analysis_id is not None:
+                response["analysis_id"] = analysis_id
+            return response
     except Exception as e:
         logger.warning("Cache check skipped: %s", e)
 
     try:
         result = soil_model.predict(tensor)
+    except RuntimeError as exc:
+        logger.error("Soil inference unavailable: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Soil analysis is temporarily unavailable because the classification model could not complete inference.",
+        ) from exc
+    except ValueError as exc:
+        logger.exception("Soil model returned an invalid prediction.")
+        raise HTTPException(status_code=500, detail="Soil model returned an invalid prediction.") from exc
     except Exception as exc:
         logger.exception("Soil inference failed")
-        raise HTTPException(status_code=500, detail=f"Inference error: {exc}")
+        raise HTTPException(status_code=500, detail="Soil inference failed.") from exc
 
     try:
         await cache.set(f"soil:{cache_key}", result, ttl=3600)
     except Exception as e:
         logger.warning("Cache write skipped: %s", e)
 
-    return {**result, "cached": False}
+    response = {**result, "cached": False}
+    analysis_id = await save_inference_result(
+        request, save_options, "soil", response
+    )
+    if analysis_id is not None:
+        response["analysis_id"] = analysis_id
+    return response
 
 
 # ── Crop recommendation ───────────────────────────────────────────────────────
@@ -404,6 +658,7 @@ async def analyze_soil(
 async def recommend_crop(
     request : Request,
     data    : CropInput,
+    save_options: Annotated[AnalysisSaveOptions, Depends()] = AnalysisSaveOptions(),
 ):
     global crop_model_obj
     if crop_model_obj is None:
@@ -418,7 +673,13 @@ async def recommend_crop(
     try:
         cached = await cache.get(cache_key)
         if cached and isinstance(cached, dict):
-            return {**cached, "cached": True}
+            response = {**cached, "cached": True}
+            analysis_id = await save_inference_result(
+                request, save_options, "crop", response
+            )
+            if analysis_id is not None:
+                response["analysis_id"] = analysis_id
+            return response
     except Exception as e:
         logger.warning("Cache check skipped: %s", e)
 
@@ -442,7 +703,13 @@ async def recommend_crop(
     except Exception as e:
         logger.warning("Cache write skipped: %s", e)
 
-    return {**result, "cached": False}
+    response = {**result, "cached": False}
+    analysis_id = await save_inference_result(
+        request, save_options, "crop", response
+    )
+    if analysis_id is not None:
+        response["analysis_id"] = analysis_id
+    return response
 
 
 # ── Advice (Streaming RAG + LLM) ──────────────────────────────────────────────

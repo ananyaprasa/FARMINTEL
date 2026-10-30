@@ -24,32 +24,32 @@ SOIL_CLASSES = ["Alluvial soil", "Black Soil", "Clay soil", "Red soil"]
 
 SOIL_PROPERTIES: dict[str, dict] = {
     "Alluvial soil": {
-        "water_retention": "High",
-        "drainage":        "Good",
-        "fertility":       "Very High",
+        "water_retention": "Often high",
+        "drainage":        "Varies by location",
+        "fertility":       "Often fertile",
         "suitable_crops":  ["Wheat", "Rice", "Sugarcane", "Cotton"],
-        "tips":            ["Ideal for most crops", "Maintain organic matter"],
+        "tips":            ["Assess field drainage and nutrients", "Maintain organic matter using local guidance"],
     },
     "Black Soil": {
-        "water_retention": "Very High",
-        "drainage":        "Poor",
-        "fertility":       "High",
+        "water_retention": "Often very high",
+        "drainage":        "Can be slow",
+        "fertility":       "Often fertile",
         "suitable_crops":  ["Cotton", "Soybean", "Millets", "Tobacco"],
-        "tips":            ["Avoid overwatering", "Proper drainage is essential"],
+        "tips":            ["Check drainage before irrigation", "Use local advice for field management"],
     },
     "Clay soil": {
-        "water_retention": "High",
-        "drainage":        "Poor",
-        "fertility":       "High",
+        "water_retention": "Often high",
+        "drainage":        "Can be slow",
+        "fertility":       "Varies by sample",
         "suitable_crops":  ["Paddy", "Wheat", "Gram"],
-        "tips":            ["Add organic matter to improve drainage", "Avoid working when wet"],
+        "tips":            ["Consider organic matter for soil structure", "Avoid working the soil when wet"],
     },
     "Red soil": {
-        "water_retention": "Low",
-        "drainage":        "Good",
-        "fertility":       "Medium",
+        "water_retention": "Often low",
+        "drainage":        "Often free-draining",
+        "fertility":       "Varies by sample",
         "suitable_crops":  ["Groundnut", "Millets", "Pulses", "Tobacco"],
-        "tips":            ["Add lime to correct acidity", "Organic mulching retains moisture"],
+        "tips":            ["Test pH before considering amendments", "Mulch may help reduce surface moisture loss"],
     },
 }
 
@@ -62,26 +62,6 @@ def _build_efficientnet_b0(num_classes: int):
     return model
 
 
-class FallbackSoilModel:
-    def predict(self, tensor=None) -> dict:
-        props = SOIL_PROPERTIES["Alluvial soil"]
-        return {
-            "soil_type":       "Alluvial soil",
-            "confidence":      91.2,
-            "water_retention": props["water_retention"],
-            "drainage":        props["drainage"],
-            "fertility":       props["fertility"],
-            "suitable_crops":  props["suitable_crops"],
-            "tips":            props["tips"],
-            "all_classes": [
-                {"label": "Alluvial soil", "confidence": 91.2},
-                {"label": "Black Soil", "confidence": 4.5},
-                {"label": "Clay soil", "confidence": 2.8},
-                {"label": "Red soil", "confidence": 1.5},
-            ],
-        }
-
-
 class SoilModel:
     def __init__(self, model_path: str, num_classes: int = 4):
         self.model_path = Path(model_path)
@@ -91,8 +71,8 @@ class SoilModel:
 
     def load(self):
         if torch is None or not self.model_path.exists():
-            logger.warning("PyTorch or soil_model.pth missing. Using FallbackSoilModel.")
-            self.model = FallbackSoilModel()
+            logger.error("PyTorch or soil model weights are unavailable at %s.", self.model_path)
+            self.model = None
             return
 
         logger.info("Loading soil model from %s …", self.model_path)
@@ -109,13 +89,14 @@ class SoilModel:
             try:
                 state_dict = torch.load(self.model_path, map_location="cpu", weights_only=True)
             except Exception as exc:
-                logger.warning("Cannot load PyTorch soil model (%s). Using fallback.", exc)
-                self.model = FallbackSoilModel()
+                logger.exception("Cannot load PyTorch soil model: %s", exc)
+                self.model = None
                 return
 
         net = _build_efficientnet_b0(self.num_classes)
         if net is None:
-            self.model = FallbackSoilModel()
+            logger.error("Cannot build EfficientNet-B0 soil model.")
+            self.model = None
             return
 
         clean_state_dict = {}
@@ -133,33 +114,53 @@ class SoilModel:
             self.model = self.model.float().to(self.device).eval()
 
     def predict(self, tensor=None) -> dict:
-        if self.model is None or isinstance(self.model, FallbackSoilModel) or torch is None:
-            return FallbackSoilModel().predict(tensor)
+        if self.model is None or torch is None:
+            raise RuntimeError("Soil classification model is unavailable.")
 
         if not isinstance(tensor, torch.Tensor):
             try:
                 tensor = torch.from_numpy(tensor).float()
-            except Exception:
-                return FallbackSoilModel().predict(tensor)
+            except Exception as exc:
+                raise ValueError("Soil image preprocessing did not produce a valid tensor.") from exc
 
         try:
+            if tuple(tensor.shape) != (1, 3, 224, 224):
+                raise ValueError("Expected one preprocessed image with shape (1, 3, 224, 224).")
+
             with torch.no_grad():
                 logits = self.model(tensor.to(self.device))
-                probs  = torch.softmax(logits, dim=1)[0]
-                top_prob, top_idx = torch.max(probs, dim=0)
+                if not isinstance(logits, torch.Tensor) or logits.ndim != 2:
+                    raise ValueError("Soil model returned an invalid prediction shape.")
+                if logits.shape != (1, len(SOIL_CLASSES)):
+                    raise ValueError(
+                        f"Soil model must return one score for each of {len(SOIL_CLASSES)} classes."
+                    )
+                if not torch.isfinite(logits).all():
+                    raise ValueError("Soil model returned non-finite prediction values.")
 
-                soil_name = SOIL_CLASSES[top_idx.item()] if top_idx.item() < len(SOIL_CLASSES) else f"class_{top_idx.item()}"
-                confidence = round(float(top_prob) * 100, 2)
+                probs = torch.softmax(logits, dim=1)[0]
+                if not torch.isfinite(probs).all():
+                    raise ValueError("Soil model produced non-finite scores.")
+                top_probs, top_indices = torch.topk(probs, k=min(3, len(SOIL_CLASSES)))
+                top_idx = int(top_indices[0].item())
+                soil_name = SOIL_CLASSES[top_idx]
+                confidence = round(float(top_probs[0].item()) * 100, 2)
                 props = SOIL_PROPERTIES.get(soil_name, {})
 
                 all_probs = [
-                    {"label": SOIL_CLASSES[i] if i < len(SOIL_CLASSES) else f"class_{i}", "confidence": round(float(p) * 100, 2)}
+                    {"label": SOIL_CLASSES[i], "confidence": round(float(p) * 100, 2)}
                     for i, p in enumerate(probs.tolist())
+                ]
+                top_predictions = [
+                    {"label": SOIL_CLASSES[int(index)], "confidence": round(float(prob) * 100, 2)}
+                    for index, prob in zip(top_indices.tolist(), top_probs.tolist())
                 ]
 
                 return {
                     "soil_type":       soil_name,
                     "confidence":      confidence,
+                    "confidence_method": "softmax_score",
+                    "top_predictions": top_predictions,
                     "water_retention": props.get("water_retention", "Unknown"),
                     "drainage":        props.get("drainage", "Unknown"),
                     "fertility":       props.get("fertility", "Unknown"),
@@ -167,6 +168,8 @@ class SoilModel:
                     "tips":            props.get("tips", []),
                     "all_classes":     all_probs,
                 }
+        except (ValueError, RuntimeError):
+            raise
         except Exception as exc:
-            logger.warning("PyTorch soil inference failed (%s). Returning fallback prediction.", exc)
-            return FallbackSoilModel().predict(tensor)
+            logger.exception("PyTorch soil inference failed.")
+            raise RuntimeError("Soil classification inference failed.") from exc

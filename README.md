@@ -71,26 +71,31 @@ ls ../dataset/agri_ai_dataset/models/
 # crop_model.pkl  disease_model_fp16.pth  label_enoder_crop.pkl  soil_model.pth
 ```
 
-### 2. Backend (Global Python Environment)
+### 2. Backend (Python virtual environment)
 
 ```bash
-cd backend
+# From the project root, activate the existing project-root virtual environment (Windows)
+npm run venv:activate
 
-# Install dependencies (using global Python environment)
-pip install -r requirements.txt
+# In the activated Command Prompt, install backend dependencies
+python -m pip install -r backend\requirements.txt
 
-# Configure environment
-cp .env.example .env
-# Edit .env:
+# Configure backend/.env:
 #   - Set model paths
 #   - Add your OPENAI_API_KEY / LLM keys
 #   - Optionally set REDIS_URL, JWT_SECRET_KEY
+#   - Set MONGODB_URI to your private Atlas connection string
+#   - Set MONGODB_DATABASE=farmintel
 
 # Start server
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+npm start
 
 # API docs available at:
 # http://localhost:8000/docs
+# MongoDB-aware health check:
+curl http://localhost:8000/api/v1/health
+
+# When finished, type exit to close the activated Command Prompt
 ```
 
 ### 3. Add RAG knowledge (optional but recommended)
@@ -150,8 +155,103 @@ Edit `backend/.env` to match your exact setup:
 | POST   | `/api/v1/analyze/soil`    | Upload soil image → soil classification   |
 | POST   | `/api/v1/analyze/full`    | Upload both images together               |
 | POST   | `/api/v1/recommend/crop`  | Send N/P/K + climate → crop recommendation|
+| GET    | `/api/v1/weather`         | Get a location/date forecast and profile comparisons |
 | POST   | `/api/v1/advice`          | Get streaming LLM advice from all results |
-| POST   | `/api/v1/auth/token`      | Get JWT token (username/password)         |
+| GET    | `/api/v1/auth/google/start` | Start Google OAuth sign-in                |
+| POST   | `/api/v1/auth/google/callback` | Complete Google sign-in callback         |
+| GET    | `/api/v1/auth/me`         | Get the current signed-in user            |
+| POST   | `/api/v1/auth/logout`     | Clear the FarmIntel session               |
+
+### Crop recommendation data and scores
+
+`POST /api/v1/recommend/crop` accepts `N`, `P`, `K`, `temperature`, `humidity`,
+`ph`, `rainfall`, and the optional UI `language` value. The API currently
+validates inputs against these ranges: N 0–140, P 0–145, K 0–205, temperature
+8–45 °C, humidity 14–100%, pH 3.5–10, and rainfall 20–300 mm.
+
+The checked-in training CSV provides numeric N/P/K and rainfall values but does
+not identify their units or the rainfall time period. Do not convert these
+values or substitute current/daily weather for rainfall. Use soil-test results
+and rainfall measurements only when they are on a comparable scale; the app's
+weather view does not populate crop inputs.
+
+When available, the CatBoost model returns class scores. If its artifacts
+cannot be loaded, the existing fallback ranks stored crop centroids using
+feature differences divided by the existing standard-deviation values. The
+fallback's displayed percentages are shares of the similarity scores across
+the stored profiles, not calibrated probabilities. Neither score is a
+probability of crop success or yield. Responses retain the existing
+`recommended_crop`, `tip`, `recommendations`, and `input_warnings` fields and
+add `model_source` and `score_kind` to identify the method and score meaning.
+Per-factor agronomic ranges and explanations are not present in the crop data;
+recommendations are general model output, not a yield guarantee.
+
+## MongoDB Atlas connectivity
+
+The backend uses PyMongo's asynchronous client and reads `MONGODB_URI` and
+`MONGODB_DATABASE` from `backend/.env`. Set `MONGODB_DATABASE=farmintel` and
+paste the private connection string copied from Atlas into `MONGODB_URI`.
+Keep the URI only in the ignored backend `.env` file; URL-encode reserved
+characters in the database username or password. The repository's
+`env.example` intentionally leaves the URI blank.
+
+On startup, the backend attempts a read-only `ping`. `/api/v1/health` repeats
+that ping and reports `application_status` independently from
+`mongodb.status` (`connected`, `disconnected`, or `not_configured`). A failed
+database connection does not create an in-memory substitute or disable the
+existing non-database features. No database writes are used for health checks.
+
+## Google sign-in configuration
+
+The backend starts Google OAuth at `GET /api/v1/auth/google/start` and receives
+the authorization-code `form_post` at
+`POST /api/v1/auth/google/callback`. Register the exact callback URL with the
+Google OAuth client. The backend verifies the Google ID token, then upserts a
+minimal user record by the unique Google `sub` identity.
+
+Configure `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+`GOOGLE_REDIRECT_URI`, `FRONTEND_ORIGIN`, `JWT_SECRET_KEY`,
+`JWT_ALGORITHM=HS256`, `JWT_EXPIRE_MINUTES` (5–60), and an exact
+`CORS_ORIGINS` entry matching `FRONTEND_ORIGIN`. Use HTTPS origins except for
+localhost development. Generate a signing secret with at least 32 bytes of
+randomness; keep it and the Google client secret in the ignored backend
+`.env`, never in frontend build variables. Authentication fails closed when
+these settings are missing or invalid.
+
+The callback sets a short-lived HttpOnly, Secure, SameSite=None FarmIntel
+session cookie; it does not return Google tokens to the browser. `GET
+/api/v1/auth/me` resolves the session to the MongoDB user and
+`POST /api/v1/auth/logout` clears it after checking the request Origin. The
+frontend should navigate to the sign-in start URL and use
+`credentials: "include"` for `/api/v1/auth/me` and `/api/v1/auth/logout`.
+Existing prediction, weather, and advice routes remain anonymous.
+
+Run the offline/mock-backed test suite from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s backend\tests -p "test_*.py"
+```
+
+For an optional real Atlas connectivity smoke test, start the backend with the
+private values in `backend/.env`, then call:
+
+```powershell
+Invoke-RestMethod http://localhost:8000/api/v1/health | ConvertTo-Json -Depth 5
+```
+
+This performs only a MongoDB `ping`; it inserts no records. Atlas must still
+allow the development machine's public IP address in Network Access, and the
+connection string's database user must have access to the configured database.
+
+The weather endpoint preserves its selected-day Open-Meteo forecast fields and
+adds `crop_recommendations`. This weather-only comparison uses the forecast's
+hourly mean temperature and humidity against the temperature and humidity
+values in the stored crop centroids. The centroid derivation is undocumented;
+the returned 0–100 similarity score is not a crop suitability rating or a
+probability of success. The page excludes daily precipitation because the
+crop dataset does not specify the rainfall period, and it never fills the
+soil-based model's N/P/K, pH, or rainfall inputs. Use Crop Suggestion
+separately with measured soil values for its full model workflow.
 
 ---
 
